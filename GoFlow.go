@@ -8,7 +8,7 @@ import (
 	"sync"
 )
 
-// Common HTTP methods to avoid repeated string literals
+// Common HTTP methods
 const (
 	MethodGet     = "GET"
 	MethodPost    = "POST"
@@ -21,22 +21,81 @@ const (
 	MethodConnect = "CONNECT"
 )
 
-// AllMethods is a pre-initialized slice containing all HTTP methods
+// Method bitset constants
+const (
+	methodGet uint16 = 1 << iota
+	methodPost
+	methodPut
+	methodDelete
+	methodPatch
+	methodHead
+	methodOptions
+	methodTrace
+	methodConnect
+)
+
+// AllMethods contains all supported HTTP methods
 var AllMethods = []string{
 	MethodGet, MethodHead, MethodPost, MethodPut,
 	MethodPatch, MethodDelete, MethodConnect,
 	MethodOptions, MethodTrace,
 }
 
-// routeTree represents a radix tree node for faster route matching
+var methodMap = map[string]uint16{
+	MethodGet:     methodGet,
+	MethodPost:    methodPost,
+	MethodPut:     methodPut,
+	MethodDelete:  methodDelete,
+	MethodPatch:   methodPatch,
+	MethodHead:    methodHead,
+	MethodOptions: methodOptions,
+	MethodTrace:   methodTrace,
+	MethodConnect: methodConnect,
+}
+
+// Pools for various objects
+var (
+	paramsPool = sync.Pool{
+		New: func() interface{} {
+			return make(map[string]string, 8)
+		},
+	}
+
+	builderPool = sync.Pool{
+		New: func() interface{} {
+			return new(strings.Builder)
+		},
+	}
+
+	segmentsPool = sync.Pool{
+		New: func() interface{} {
+			return make([]string, 0, 8)
+		},
+	}
+)
+
+type (
+	contextKey      struct{}
+	paramContextKey struct{}
+)
+
+// methodHandler manages HTTP method handling
+type methodHandler struct {
+	handlers    map[string]http.Handler
+	allowedSet  uint16
+	allowedList string
+}
+
+// routeTree represents a node in the routing tree
 type routeTree struct {
-	segment    string
-	handlers   map[string]http.Handler
-	children   map[string]*routeTree // Changed from slice to map
-	paramChild *routeTree            // Separate parameter child
-	paramName  string
-	isWildcard bool
-	rxPattern  *regexp.Regexp
+	segment     string
+	methods     *methodHandler
+	children    map[string]*routeTree
+	paramChild  *routeTree
+	paramName   string
+	isWildcard  bool
+	rxPattern   *regexp.Regexp
+	staticPaths map[string]*routeTree
 }
 
 // Mux is the main router struct
@@ -47,30 +106,16 @@ type Mux struct {
 	Options          http.Handler
 	middlewares      []func(http.Handler) http.Handler
 	rxCache          sync.Map
+	optimized        bool
 }
 
-type contextKey string
-
-// Pool for route parameters to reduce allocations
-var paramsPool = sync.Pool{
-	New: func() interface{} {
-		return make(map[string]string, 8)
-	},
-}
-
-// Pre-allocate builder for allowed methods
-var methodsBuilder strings.Builder
-
-func newRouteTree() *routeTree {
-	return &routeTree{
-		handlers: make(map[string]http.Handler),
-		children: make(map[string]*routeTree),
-	}
-}
-
+// New creates a new Mux instance
 func New() *Mux {
 	return &Mux{
-		root:     newRouteTree(),
+		root: &routeTree{
+			children:    make(map[string]*routeTree),
+			staticPaths: make(map[string]*routeTree),
+		},
 		NotFound: http.NotFoundHandler(),
 		MethodNotAllowed: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
@@ -81,15 +126,7 @@ func New() *Mux {
 	}
 }
 
-func acquireParams() map[string]string {
-	return paramsPool.Get().(map[string]string)
-}
-
-func releaseParams(params map[string]string) {
-	clear(params)
-	paramsPool.Put(params)
-}
-
+// Handle registers a new route with its handlers
 func (m *Mux) Handle(pattern string, handler http.Handler, methods ...string) {
 	if len(methods) == 0 {
 		methods = AllMethods
@@ -99,83 +136,52 @@ func (m *Mux) Handle(pattern string, handler http.Handler, methods ...string) {
 		methods = append(methods, MethodHead)
 	}
 
-	segments := strings.Split(strings.Trim(pattern, "/"), "/")
 	wrappedHandler := m.wrap(handler)
-
 	for _, method := range methods {
-		m.addRoute(segments, strings.ToUpper(method), wrappedHandler)
+		m.addRoute(pattern, strings.ToUpper(method), wrappedHandler)
+	}
+
+	// Pre-compute static paths after adding new routes
+	if m.optimized {
+		m.precomputeStaticPaths()
 	}
 }
 
-func (m *Mux) addRoute(segments []string, method string, handler http.Handler) {
-	current := m.root
+// ServeHTTP implements the http.Handler interface
+func (m *Mux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Path
+	if path == "" {
+		path = "/"
+	}
 
-	for i, segment := range segments {
-		if segment == "..." {
-			current.isWildcard = true
-			current.handlers[method] = handler
+	// Get segments from pool
+	segments := splitPath(path)
+	if segments == nil {
+		segments = segmentsPool.Get().([]string)[:0]
+	}
+	defer segmentsPool.Put(segments)
+
+	// Get params from pool
+	params := paramsPool.Get().(map[string]string)
+	defer func() {
+		clear(params)
+		paramsPool.Put(params)
+	}()
+
+	methods, foundParams, found := m.findHandler(m.root, segments, params)
+
+	if found && methods != nil {
+		if handler, ok := methods.handlers[r.Method]; ok {
+			ctx := r.Context()
+			if len(foundParams) > 0 {
+				ctx = context.WithValue(ctx, paramContextKey{}, foundParams)
+			}
+			handler.ServeHTTP(w, r.WithContext(ctx))
 			return
 		}
 
-		var child *routeTree
-		if strings.HasPrefix(segment, ":") {
-			paramName, rxPattern, hasRx := strings.Cut(strings.TrimPrefix(segment, ":"), "|")
-			child = m.findOrCreateChild(current, "", paramName)
-
-			if hasRx {
-				rx, _ := m.rxCache.LoadOrStore(rxPattern, regexp.MustCompile(rxPattern))
-				child.rxPattern = rx.(*regexp.Regexp)
-			}
-		} else {
-			child = m.findOrCreateChild(current, segment, "")
-		}
-
-		if i == len(segments)-1 {
-			child.handlers[method] = handler
-		}
-		current = child
-	}
-}
-
-func (m *Mux) findOrCreateChild(node *routeTree, segment, paramName string) *routeTree {
-	if paramName != "" {
-		if node.paramChild == nil {
-			node.paramChild = newRouteTree()
-			node.paramChild.paramName = paramName
-		}
-		return node.paramChild
-	}
-
-	child, exists := node.children[segment]
-	if !exists {
-		child = newRouteTree()
-		child.segment = segment
-		node.children[segment] = child
-	}
-	return child
-}
-
-func (m *Mux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	path := strings.Trim(r.URL.EscapedPath(), "/")
-	segments := strings.Split(path, "/")
-
-	params := acquireParams()
-	defer releaseParams(params)
-
-	handler, params, allowed := m.findHandler(m.root, segments, params)
-
-	if handler != nil && allowed[r.Method] {
-		ctx := r.Context()
-		for k, v := range params {
-			ctx = context.WithValue(ctx, contextKey(k), v)
-		}
-		handler[r.Method].ServeHTTP(w, r.WithContext(ctx))
-		return
-	}
-
-	if len(allowed) > 0 {
-		methods := makeAllowedMethodsHeader(allowed)
-		w.Header().Set("Allow", methods)
+		// Method not allowed
+		w.Header().Set("Allow", methods.allowedList)
 		if r.Method == MethodOptions {
 			m.wrap(m.Options).ServeHTTP(w, r)
 		} else {
@@ -187,50 +193,12 @@ func (m *Mux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	m.wrap(m.NotFound).ServeHTTP(w, r)
 }
 
-func (m *Mux) findHandler(node *routeTree, segments []string, params map[string]string) (map[string]http.Handler, map[string]string, map[string]bool) {
-	if len(segments) == 0 {
-		if len(node.handlers) > 0 {
-			return node.handlers, params, makeAllowedMethodsMap(node.handlers)
-		}
-		return nil, nil, nil
-	}
-
-	if node.isWildcard {
-		params["..."] = strings.Join(segments, "/")
-		return node.handlers, params, makeAllowedMethodsMap(node.handlers)
-	}
-
-	segment := segments[0]
-	remainingSegments := segments[1:]
-
-	// Try exact match first - O(1) lookup
-	if child, exists := node.children[segment]; exists {
-		if h, p, a := m.findHandler(child, remainingSegments, params); h != nil {
-			return h, p, a
-		}
-	}
-
-	// Try parameter match
-	if node.paramChild != nil {
-		if node.paramChild.rxPattern != nil && !node.paramChild.rxPattern.MatchString(segment) {
-			return nil, nil, nil
-		}
-
-		newParams := copyParams(params)
-		newParams[node.paramChild.paramName] = segment
-
-		if h, p, a := m.findHandler(node.paramChild, remainingSegments, newParams); h != nil {
-			return h, p, a
-		}
-	}
-
-	return nil, nil, nil
-}
-
+// Use adds middleware to the router
 func (m *Mux) Use(mw ...func(http.Handler) http.Handler) {
 	m.middlewares = append(m.middlewares, mw...)
 }
 
+// Group creates a new route group
 func (m *Mux) Group(fn func(*Mux)) {
 	subMux := &Mux{
 		root:        m.root,
@@ -240,63 +208,18 @@ func (m *Mux) Group(fn func(*Mux)) {
 	fn(subMux)
 }
 
-func (m *Mux) wrap(handler http.Handler) http.Handler {
-	for i := len(m.middlewares) - 1; i >= 0; i-- {
-		handler = m.middlewares[i](handler)
+// Optimize applies performance optimizations
+func (m *Mux) Optimize() {
+	if !m.optimized {
+		m.precomputeStaticPaths()
+		m.optimized = true
 	}
-	return handler
 }
 
-func makeAllowedMethodsHeader(allowed map[string]bool) string {
-	methodsBuilder.Reset()
-	first := true
-
-	for method := range allowed {
-		if !first {
-			methodsBuilder.WriteString(", ")
-		}
-		methodsBuilder.WriteString(method)
-		first = false
-	}
-
-	if len(allowed) > 0 {
-		if !first {
-			methodsBuilder.WriteString(", ")
-		}
-		methodsBuilder.WriteString(MethodOptions)
-	}
-
-	return methodsBuilder.String()
-}
-
-func contains(slice []string, item string) bool {
-	for _, s := range slice {
-		if s == item {
-			return true
-		}
-	}
-	return false
-}
-
-func copyParams(params map[string]string) map[string]string {
-	newParams := make(map[string]string, len(params))
-	for k, v := range params {
-		newParams[k] = v
-	}
-	return newParams
-}
-
-func makeAllowedMethodsMap(handlers map[string]http.Handler) map[string]bool {
-	allowed := make(map[string]bool)
-	for method := range handlers {
-		allowed[method] = true
-	}
-	return allowed
-}
-
+// Param gets a route parameter from the context
 func Param(ctx context.Context, param string) string {
-	if v, ok := ctx.Value(contextKey(param)).(string); ok {
-		return v
+	if params, ok := ctx.Value(paramContextKey{}).(map[string]string); ok {
+		return params[param]
 	}
 	return ""
 }
