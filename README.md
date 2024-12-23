@@ -6,8 +6,11 @@ optimizations.
 
 ## Features
 
-- ⚡ High Performance: Optimized route matching with radix tree implementation
-- 🎯 Zero External Dependencies: Pure Go implementation
+- ⚡ High Performance:
+    - 9.3M requests/second for static routes
+    - 6.7M requests/second for parameter routes
+    - Optimized memory usage and allocations
+- 🎯 Zero External Dependencies
 - 🔒 Thread-Safe: Concurrent request handling
 - 🛣️ Flexible Routing:
     - Named parameters with regex validation
@@ -23,6 +26,16 @@ optimizations.
     - Rate limiting
 - 🎮 Easy to Use API
 - 📊 Extensive Testing & Benchmarks
+
+## Benchmark Results
+
+```
+BenchmarkParallelRequests/ParallelStaticRoute-16          9300190    127.4 ns/op    344 B/op    2 allocs/op
+BenchmarkParallelRequests/ParallelParameterRoute-16       6721171    189.4 ns/op    392 B/op    3 allocs/op
+BenchmarkParallelRequests/ParallelWildcardRoute-16        5221261    227.2 ns/op    416 B/op    4 allocs/op
+BenchmarkMethodNotAllowed-16                              2229696    520.2 ns/op    148 B/op    5 allocs/op
+BenchmarkNotFound-16                                      2727050    436.8 ns/op    121 B/op    4 allocs/op
+```
 
 ## Installation
 
@@ -90,44 +103,6 @@ func userHandler(w http.ResponseWriter, r *http.Request) {
 }
 ```
 
-## Route Patterns
-
-### Basic Routes
-
-```go
-mux.Handle("/", handler, "GET")
-mux.Handle("/about", handler, "GET", "POST")
-```
-
-### Named Parameters
-
-```go
-// Match: /users/123
-mux.Handle("/users/:id", handler, "GET")
-
-// Access parameter in handler
-func handler(w http.ResponseWriter, r *http.Request) {
-id := GoFlow.Param(r.Context(), "id")
-}
-```
-
-### Regex Validation
-
-```go
-// Only match numeric IDs
-mux.Handle("/users/:id|^\\d+$", handler, "GET")
-
-// Custom regex pattern
-mux.Handle("/posts/:slug|^[a-z0-9-]+$", handler, "GET")
-```
-
-### Wildcard Routes
-
-```go
-// Match any path after /static/
-mux.Handle("/static/...", handler, "GET")
-```
-
 ## Built-in Middleware
 
 ### Recovery Middleware
@@ -154,57 +129,22 @@ mux.Use(GoFlow.Timeout(30 * time.Second))
 mux.Use(GoFlow.RateLimit(100, time.Minute)) // 100 requests per minute
 ```
 
-## Custom Middleware
+### CORS Middleware
 
 ```go
-func customMiddleware(next http.Handler) http.Handler {
-return http.HandlerFunc(func (w http.ResponseWriter, r *http.Request) {
-// Do something before
-next.ServeHTTP(w, r)
-// Do something after
-})
-}
-
-mux.Use(customMiddleware)
+mux.Use(GoFlow.CORS([]string{"*"}, []string{"GET", "POST"}, []string{"Content-Type"}))
 ```
 
-## Route Groups
+### Compression Middleware
 
 ```go
-mux.Group(func (m *GoFlow.Mux) {
-// Group middleware
-m.Use(authMiddleware)
-
-// Group routes
-m.Handle("/admin", adminHandler, "GET")
-
-// Nested group
-m.Group(func (m *GoFlow.Mux) {
-m.Use(superAdminMiddleware)
-m.Handle("/admin/settings", settingsHandler, "GET")
-})
-})
+mux.Use(GoFlow.Compression())
 ```
 
-## Error Handling
-
-### Custom Not Found Handler
+### Cache Middleware
 
 ```go
-mux := GoFlow.New()
-mux.NotFound = http.HandlerFunc(func (w http.ResponseWriter, r *http.Request) {
-w.WriteHeader(http.StatusNotFound)
-fmt.Fprintf(w, "Custom 404 - Page not found")
-})
-```
-
-### Custom Method Not Allowed Handler
-
-```go
-mux.MethodNotAllowed = http.HandlerFunc(func (w http.ResponseWriter, r *http.Request) {
-w.WriteHeader(http.StatusMethodNotAllowed)
-fmt.Fprintf(w, "Method not allowed")
-})
+mux.Use(GoFlow.Cache(5 * time.Minute))
 ```
 
 ## Performance Optimizations
@@ -216,14 +156,8 @@ GoFlow includes several performance optimizations:
 - Pre-compiled regex patterns
 - Efficient string building for headers
 - Minimal allocations in hot paths
-
-## Benchmarks
-
-Run the benchmarks:
-
-```bash
-go test -bench=. -benchmem
-```
+- Smart middleware chaining
+- Memory pooling for common operations
 
 ## Contributing
 
