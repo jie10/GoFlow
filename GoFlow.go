@@ -31,29 +31,46 @@ var AllMethods = []string{
 // routeTree represents a radix tree node for faster route matching
 type routeTree struct {
 	segment    string
-	handlers   map[string]http.Handler // Method -> Handler mapping
-	children   []*routeTree
+	handlers   map[string]http.Handler
+	children   map[string]*routeTree // Changed from slice to map
+	paramChild *routeTree            // Separate parameter child
 	paramName  string
 	isWildcard bool
 	rxPattern  *regexp.Regexp
 }
 
+// Mux is the main router struct
 type Mux struct {
 	root             *routeTree
 	NotFound         http.Handler
 	MethodNotAllowed http.Handler
 	Options          http.Handler
 	middlewares      []func(http.Handler) http.Handler
-	rxCache          sync.Map // Thread-safe cache for regexp patterns
+	rxCache          sync.Map
 }
 
 type contextKey string
 
+// Pool for route parameters to reduce allocations
+var paramsPool = sync.Pool{
+	New: func() interface{} {
+		return make(map[string]string, 8)
+	},
+}
+
+// Pre-allocate builder for allowed methods
+var methodsBuilder strings.Builder
+
+func newRouteTree() *routeTree {
+	return &routeTree{
+		handlers: make(map[string]http.Handler),
+		children: make(map[string]*routeTree),
+	}
+}
+
 func New() *Mux {
 	return &Mux{
-		root: &routeTree{
-			handlers: make(map[string]http.Handler),
-		},
+		root:     newRouteTree(),
 		NotFound: http.NotFoundHandler(),
 		MethodNotAllowed: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
@@ -64,12 +81,20 @@ func New() *Mux {
 	}
 }
 
+func acquireParams() map[string]string {
+	return paramsPool.Get().(map[string]string)
+}
+
+func releaseParams(params map[string]string) {
+	clear(params)
+	paramsPool.Put(params)
+}
+
 func (m *Mux) Handle(pattern string, handler http.Handler, methods ...string) {
 	if len(methods) == 0 {
 		methods = AllMethods
 	}
 
-	// Automatically add HEAD if GET is present
 	if contains(methods, MethodGet) && !contains(methods, MethodHead) {
 		methods = append(methods, MethodHead)
 	}
@@ -113,26 +138,31 @@ func (m *Mux) addRoute(segments []string, method string, handler http.Handler) {
 }
 
 func (m *Mux) findOrCreateChild(node *routeTree, segment, paramName string) *routeTree {
-	for _, child := range node.children {
-		if child.segment == segment && child.paramName == paramName {
-			return child
+	if paramName != "" {
+		if node.paramChild == nil {
+			node.paramChild = newRouteTree()
+			node.paramChild.paramName = paramName
 		}
+		return node.paramChild
 	}
 
-	newChild := &routeTree{
-		segment:   segment,
-		paramName: paramName,
-		handlers:  make(map[string]http.Handler),
+	child, exists := node.children[segment]
+	if !exists {
+		child = newRouteTree()
+		child.segment = segment
+		node.children[segment] = child
 	}
-	node.children = append(node.children, newChild)
-	return newChild
+	return child
 }
 
 func (m *Mux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := strings.Trim(r.URL.EscapedPath(), "/")
 	segments := strings.Split(path, "/")
 
-	handler, params, allowed := m.findHandler(m.root, segments, make(map[string]string))
+	params := acquireParams()
+	defer releaseParams(params)
+
+	handler, params, allowed := m.findHandler(m.root, segments, params)
 
 	if handler != nil && allowed[r.Method] {
 		ctx := r.Context()
@@ -144,7 +174,8 @@ func (m *Mux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(allowed) > 0 {
-		w.Header().Set("Allow", strings.Join(append(stringMapKeys(allowed), MethodOptions), ", "))
+		methods := makeAllowedMethodsHeader(allowed)
+		w.Header().Set("Allow", methods)
 		if r.Method == MethodOptions {
 			m.wrap(m.Options).ServeHTTP(w, r)
 		} else {
@@ -172,35 +203,30 @@ func (m *Mux) findHandler(node *routeTree, segments []string, params map[string]
 	segment := segments[0]
 	remainingSegments := segments[1:]
 
-	// Try exact match first
-	for _, child := range node.children {
-		if child.segment == segment {
-			if h, p, a := m.findHandler(child, remainingSegments, params); h != nil {
-				return h, p, a
-			}
+	// Try exact match first - O(1) lookup
+	if child, exists := node.children[segment]; exists {
+		if h, p, a := m.findHandler(child, remainingSegments, params); h != nil {
+			return h, p, a
 		}
 	}
 
-	// Try parameter matches
-	for _, child := range node.children {
-		if child.paramName != "" {
-			if child.rxPattern != nil && !child.rxPattern.MatchString(segment) {
-				continue
-			}
+	// Try parameter match
+	if node.paramChild != nil {
+		if node.paramChild.rxPattern != nil && !node.paramChild.rxPattern.MatchString(segment) {
+			return nil, nil, nil
+		}
 
-			newParams := copyParams(params)
-			newParams[child.paramName] = segment
+		newParams := copyParams(params)
+		newParams[node.paramChild.paramName] = segment
 
-			if h, p, a := m.findHandler(child, remainingSegments, newParams); h != nil {
-				return h, p, a
-			}
+		if h, p, a := m.findHandler(node.paramChild, remainingSegments, newParams); h != nil {
+			return h, p, a
 		}
 	}
 
 	return nil, nil, nil
 }
 
-// Helper functions
 func (m *Mux) Use(mw ...func(http.Handler) http.Handler) {
 	m.middlewares = append(m.middlewares, mw...)
 }
@@ -221,7 +247,28 @@ func (m *Mux) wrap(handler http.Handler) http.Handler {
 	return handler
 }
 
-// Utility functions
+func makeAllowedMethodsHeader(allowed map[string]bool) string {
+	methodsBuilder.Reset()
+	first := true
+
+	for method := range allowed {
+		if !first {
+			methodsBuilder.WriteString(", ")
+		}
+		methodsBuilder.WriteString(method)
+		first = false
+	}
+
+	if len(allowed) > 0 {
+		if !first {
+			methodsBuilder.WriteString(", ")
+		}
+		methodsBuilder.WriteString(MethodOptions)
+	}
+
+	return methodsBuilder.String()
+}
+
 func contains(slice []string, item string) bool {
 	for _, s := range slice {
 		if s == item {
@@ -245,14 +292,6 @@ func makeAllowedMethodsMap(handlers map[string]http.Handler) map[string]bool {
 		allowed[method] = true
 	}
 	return allowed
-}
-
-func stringMapKeys(m map[string]bool) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	return keys
 }
 
 func Param(ctx context.Context, param string) string {
