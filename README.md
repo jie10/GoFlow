@@ -163,10 +163,6 @@ GoFlow includes several performance optimizations:
 
 Contributions are welcome! Please feel free to submit a Pull Request.
 
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
-
 ## Acknowledgments
 
 Based on the excellent [alexedwards/flow](https://github.com/alexedwards/flow) router, with additional features and
