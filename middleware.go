@@ -3,14 +3,16 @@ package GoFlow
 import (
 	"bytes"
 	"compress/gzip"
-	"container/list"
 	"context"
+	"hash/maphash"
 	"log"
 	"net/http"
+	"runtime"
 	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -87,48 +89,130 @@ func Logger() func(http.Handler) http.Handler {
 	}
 }
 
-type RateLimiter struct {
-	buckets   sync.Map
-	maxSize   int
-	evictList *list.List // For LRU eviction
-	mu        sync.Mutex
+// Sharded bucket storage for reduced lock contention
+type bucketShard struct {
+	sync.RWMutex
+	buckets map[string]*bucket
 }
 
-func (rl *RateLimiter) cleanup() {
-	rl.mu.Lock()
-	for rl.evictList.Len() > rl.maxSize {
-		if elem := rl.evictList.Back(); elem != nil {
-			rl.buckets.Delete(elem.Value)
-			rl.evictList.Remove(elem)
+type RateLimiter struct {
+	shards   []bucketShard
+	requests int32
+	burst    int32
+	interval int64 // nanoseconds
+	maxSize  int32
+	seed     maphash.Seed
+}
+
+type bucket struct {
+	tokens   int32
+	burst    int32
+	lastSeen int64 // Unix nano
+}
+
+func NewRateLimiter(requests int, duration time.Duration, burst int) *RateLimiter {
+	numShards := runtime.GOMAXPROCS(0) * 4
+	shards := make([]bucketShard, numShards)
+
+	for i := range shards {
+		shards[i] = bucketShard{
+			buckets: make(map[string]*bucket, 1024), // Pre-allocate
 		}
 	}
-	rl.mu.Unlock()
+
+	return &RateLimiter{
+		shards:   shards,
+		requests: int32(requests),
+		burst:    int32(burst),
+		interval: duration.Nanoseconds(),
+		maxSize:  32768,
+		seed:     maphash.MakeSeed(),
+	}
+}
+
+func (rl *RateLimiter) getShard(key string) *bucketShard {
+	h := maphash.Hash{}
+	h.SetSeed(rl.seed)
+	h.WriteString(key)
+	return &rl.shards[h.Sum64()%uint64(len(rl.shards))]
+}
+
+func (rl *RateLimiter) Allow(key string) bool {
+	shard := rl.getShard(key)
+	now := time.Now().UnixNano()
+
+	// Fast path with read lock
+	shard.RLock()
+	b, exists := shard.buckets[key]
+	shard.RUnlock()
+
+	if exists {
+		lastSeen := atomic.LoadInt64(&b.lastSeen)
+		elapsed := now - lastSeen
+
+		if elapsed >= rl.interval {
+			// Reset tokens atomically
+			atomic.StoreInt32(&b.tokens, rl.requests)
+			atomic.StoreInt32(&b.burst, rl.burst)
+			atomic.StoreInt64(&b.lastSeen, now)
+			return true
+		}
+
+		// Try regular tokens first
+		for {
+			tokens := atomic.LoadInt32(&b.tokens)
+			if tokens <= 0 {
+				break
+			}
+			if atomic.CompareAndSwapInt32(&b.tokens, tokens, tokens-1) {
+				return true
+			}
+		}
+
+		// Try burst tokens if available
+		for {
+			burst := atomic.LoadInt32(&b.burst)
+			if burst <= 0 {
+				return false
+			}
+			if atomic.CompareAndSwapInt32(&b.burst, burst, burst-1) {
+				return true
+			}
+		}
+	}
+
+	// Slow path: create new bucket
+	shard.Lock()
+	defer shard.Unlock()
+
+	// Double check after lock
+	if _, ok := shard.buckets[key]; ok {
+		return rl.Allow(key) // Retry fast path
+	}
+
+	// Clean old entries if needed
+	if len(shard.buckets) >= int(rl.maxSize) {
+		threshold := now - rl.interval*2
+		for k, v := range shard.buckets {
+			if atomic.LoadInt64(&v.lastSeen) < threshold {
+				delete(shard.buckets, k)
+			}
+		}
+	}
+
+	// Create new bucket
+	b = &bucket{
+		tokens:   rl.requests - 1,
+		burst:    rl.burst,
+		lastSeen: now,
+	}
+	shard.buckets[key] = b
+	return true
 }
 
 // RateLimit implements a token bucket rate limiting middleware
-func RateLimit(requests int, duration time.Duration) func(http.Handler) http.Handler {
-	type bucket struct {
-		tokens   int
-		lastSeen time.Time
-		mu       sync.Mutex
-	}
-
-	buckets := sync.Map{}
-
-	// Clean up old buckets periodically
-	go func() {
-		for range time.Tick(duration) {
-			buckets.Range(func(key, value interface{}) bool {
-				b := value.(*bucket)
-				b.mu.Lock()
-				if time.Since(b.lastSeen) > duration*2 {
-					buckets.Delete(key)
-				}
-				b.mu.Unlock()
-				return true
-			})
-		}
-	}()
+func RateLimit(requests int, duration time.Duration, burst int) func(http.Handler) http.Handler {
+	limiter := NewRateLimiter(requests, duration, burst)
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -140,35 +224,14 @@ func RateLimit(requests int, duration time.Duration) func(http.Handler) http.Han
 				}
 			}
 
-			var b *bucket
-			if v, ok := buckets.Load(ip); ok {
-				b = v.(*bucket)
-			} else {
-				b = &bucket{tokens: requests}
-				buckets.Store(ip, b)
-			}
-
-			b.mu.Lock()
-			defer b.mu.Unlock()
-
-			// Replenish tokens based on time passed
-			elapsed := time.Since(b.lastSeen)
-			newTokens := int(elapsed.Seconds() * float64(requests) / duration.Seconds())
-			b.tokens = min(requests, b.tokens+newTokens)
-			b.lastSeen = time.Now()
-
-			if b.tokens <= 0 {
-				w.Header().Set("X-RateLimit-Limit", toString(requests))
+			if !limiter.Allow(ip) {
+				w.Header().Set("X-RateLimit-Limit", toString(int(limiter.requests)))
+				w.Header().Set("X-RateLimit-Burst", toString(int(limiter.burst)))
 				w.Header().Set("X-RateLimit-Remaining", "0")
-				w.Header().Set("X-RateLimit-Reset", toString(int(duration.Seconds())))
+				w.Header().Set("X-RateLimit-Reset", toString(int(limiter.interval/1e9)))
 				http.Error(w, "Too many requests", http.StatusTooManyRequests)
 				return
 			}
-
-			b.tokens--
-			w.Header().Set("X-RateLimit-Limit", toString(requests))
-			w.Header().Set("X-RateLimit-Remaining", toString(b.tokens))
-			w.Header().Set("X-RateLimit-Reset", toString(int(duration.Seconds())))
 
 			next.ServeHTTP(w, r)
 		})
