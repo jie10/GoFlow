@@ -86,26 +86,44 @@ type methodHandler struct {
 	allowedList string
 }
 
-// routeTree represents a node in the routing tree
-type routeTree struct {
-	segment     string
-	methods     *methodHandler
-	children    map[string]*routeTree
-	paramChild  *routeTree
-	paramName   string
-	isWildcard  bool
-	rxPattern   *regexp.Regexp
-	staticPaths map[string]*routeTree
+type routeNode struct {
+	get     http.Handler
+	methods *methodHandler
 }
 
-// Mux is the main router struct
+// routeTree represents a node in the routing tree
+type routeTree struct {
+	segment        string
+	methods        *methodHandler
+	children       map[string]*routeTree
+	paramChild     *routeTree
+	paramName      string
+	isWildcard     bool
+	rxPattern      *regexp.Regexp
+	staticHandlers map[string]routeNode
+}
+
+// Add after existing type definitions
+type routeCacheEntry struct {
+	methods *methodHandler
+	params  map[string]string
+}
+
+type MiddlewareChain struct {
+	handlers []func(http.Handler) http.Handler
+	cached   http.Handler
+}
+
+// Update Mux struct
 type Mux struct {
 	root             *routeTree
 	NotFound         http.Handler
 	MethodNotAllowed http.Handler
 	Options          http.Handler
 	middlewares      []func(http.Handler) http.Handler
+	middlewareChain  MiddlewareChain // Add this
 	rxCache          sync.Map
+	pathCache        sync.Map // Add this
 	optimized        bool
 }
 
@@ -113,8 +131,8 @@ type Mux struct {
 func New() *Mux {
 	return &Mux{
 		root: &routeTree{
-			children:    make(map[string]*routeTree),
-			staticPaths: make(map[string]*routeTree),
+			children:       make(map[string]*routeTree),
+			staticHandlers: make(map[string]routeNode),
 		},
 		NotFound: http.NotFoundHandler(),
 		MethodNotAllowed: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -154,8 +172,24 @@ func (m *Mux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		path = "/"
 	}
 
+	// Fast path for GET requests
+	if r.Method == MethodGet {
+		if route, ok := m.root.staticHandlers[path[1:]]; ok && route.get != nil {
+			route.get.ServeHTTP(w, r)
+			return
+		}
+	}
+
+	// Optimize struct pooling
+	sw := responseWriterPool.Get().(*statusWriter)
+	sw.ResponseWriter = w
+	sw.status = 0
+	sw.size = 0
+	clear(sw.headers)
+	defer responseWriterPool.Put(sw)
+
 	// Get segments from pool
-	segments := splitPath(path)
+	segments := m.getPathSegments(path)
 	if segments == nil {
 		segments = segmentsPool.Get().([]string)[:0]
 	}
@@ -172,30 +206,77 @@ func (m *Mux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if found && methods != nil {
 		if handler, ok := methods.handlers[r.Method]; ok {
-			ctx := r.Context()
 			if len(foundParams) > 0 {
-				ctx = context.WithValue(ctx, paramContextKey{}, foundParams)
+				ctx := context.WithValue(r.Context(), paramContextKey{}, foundParams)
+				handler.ServeHTTP(sw, r.WithContext(ctx))
+				return
 			}
-			handler.ServeHTTP(w, r.WithContext(ctx))
+			handler.ServeHTTP(sw, r)
 			return
 		}
-
-		// Method not allowed
-		w.Header().Set("Allow", methods.allowedList)
+		sw.Header().Set("Allow", methods.allowedList)
 		if r.Method == MethodOptions {
-			m.wrap(m.Options).ServeHTTP(w, r)
+			m.wrap(m.Options).ServeHTTP(sw, r)
 		} else {
-			m.wrap(m.MethodNotAllowed).ServeHTTP(w, r)
+			m.wrap(m.MethodNotAllowed).ServeHTTP(sw, r)
 		}
 		return
 	}
 
-	m.wrap(m.NotFound).ServeHTTP(w, r)
+	m.wrap(m.NotFound).ServeHTTP(sw, r)
+}
+
+func (m *Mux) getPathSegments(path string) []string {
+	if path == "" || path == "/" {
+		return nil
+	}
+
+	segments := segmentsPool.Get().([]string)
+	segments = segments[:0]
+
+	var start int
+	for i := 1; i < len(path); i++ {
+		if path[i] == '/' {
+			segments = append(segments, path[start+1:i])
+			start = i
+		} else if i == len(path)-1 {
+			segments = append(segments, path[start+1:])
+		}
+	}
+
+	return segments
+}
+
+func (m *Mux) getStaticHandler(path string, method string) http.Handler {
+	if route, ok := m.root.staticHandlers[strings.TrimPrefix(path, "/")]; ok {
+		if method == MethodGet {
+			return route.get
+		}
+		if route.methods != nil {
+			return route.methods.handlers[method]
+		}
+	}
+	return nil
+}
+
+func (m *Mux) lookupStaticRoute(path string) *routeTree {
+	if !m.optimized {
+		return nil
+	}
+	if pathLen := len(path); pathLen > 1 && path[pathLen-1] == '/' {
+		path = path[:pathLen-1]
+	}
+	if route, ok := m.root.staticHandlers[path[1:]]; ok {
+		return &routeTree{methods: route.methods}
+	}
+	return nil
 }
 
 // Use adds middleware to the router
 func (m *Mux) Use(mw ...func(http.Handler) http.Handler) {
 	m.middlewares = append(m.middlewares, mw...)
+	// Reset middleware chain cache
+	m.middlewareChain.cached = nil
 }
 
 // Group creates a new route group
