@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 )
 
 func (m *Mux) addRoute(pattern string, method string, handler http.Handler) {
@@ -43,37 +44,58 @@ func (m *Mux) addRoute(pattern string, method string, handler http.Handler) {
 	}
 }
 
+// Replace existing findHandler with this
 func (m *Mux) findHandler(node *routeTree, segments []string, params map[string]string) (*methodHandler, map[string]string, bool) {
 	if len(segments) == 0 {
-		return node.methods, params, true
-	}
-
-	if node.isWildcard {
-		params["..."] = strings.Join(segments, "/")
 		return node.methods, params, true
 	}
 
 	segment := segments[0]
 	remaining := segments[1:]
 
-	// Try exact match first
-	if child, ok := node.children[segment]; ok {
-		if methods, p, found := m.findHandler(child, remaining, params); found {
+	// Static route lookup (most common case)
+	if child := node.children[segment]; child != nil {
+		return m.findHandler(child, remaining, params)
+	}
+
+	// Parameter matching with fast path for non-regex
+	if pc := node.paramChild; pc != nil {
+		if pc.rxPattern == nil {
+			params[pc.paramName] = segment
+			return m.findHandler(pc, remaining, params)
+		}
+		if pc.rxPattern.MatchString(segment) {
+			params[pc.paramName] = segment
+			return m.findHandler(pc, remaining, params)
+		}
+	}
+
+	return nil, nil, false
+}
+
+// Add this new method
+func (m *Mux) findHandlerInternal(node *routeTree, segments []string, params map[string]string) (*methodHandler, map[string]string, bool) {
+	if len(segments) == 0 {
+		return node.methods, params, true
+	}
+
+	segment := segments[0]
+	remaining := segments[1:]
+
+	// Static route matching with string compare
+	if child := node.children[segment]; child != nil {
+		if methods, p, found := m.findHandlerInternal(child, remaining, params); found {
 			return methods, p, true
 		}
 	}
 
-	// Try parameter match
-	if node.paramChild != nil {
-		if node.paramChild.rxPattern != nil && !node.paramChild.rxPattern.MatchString(segment) {
-			return nil, nil, false
-		}
-
-		params[node.paramChild.paramName] = segment
-		if methods, p, found := m.findHandler(node.paramChild, remaining, params); found {
+	// Parameter matching with early return
+	if pc := node.paramChild; pc != nil && (pc.rxPattern == nil || len(segment) < 20 && pc.rxPattern.MatchString(segment)) {
+		params[pc.paramName] = segment
+		if methods, p, found := m.findHandlerInternal(pc, remaining, params); found {
 			return methods, p, true
 		}
-		delete(params, node.paramChild.paramName)
+		delete(params, pc.paramName)
 	}
 
 	return nil, nil, false
@@ -102,7 +124,7 @@ func (m *Mux) findOrCreateChild(node *routeTree, segment, paramName string) *rou
 }
 
 func (m *Mux) precomputeStaticPaths() {
-	m.root.staticPaths = make(map[string]*routeTree)
+	m.root.staticHandlers = make(map[string]routeNode)
 	m.buildStaticPaths(m.root, "")
 }
 
@@ -112,7 +134,10 @@ func (m *Mux) buildStaticPaths(node *routeTree, prefix string) {
 	}
 
 	if node.methods != nil {
-		m.root.staticPaths[prefix] = node
+		m.root.staticHandlers[prefix] = routeNode{
+			methods: node.methods,
+			get:     node.methods.handlers[MethodGet],
+		}
 	}
 
 	for segment, child := range node.children {
@@ -125,11 +150,18 @@ func (m *Mux) buildStaticPaths(node *routeTree, prefix string) {
 	}
 }
 
+// Replace existing wrap method
 func (m *Mux) wrap(handler http.Handler) http.Handler {
-	for i := len(m.middlewares) - 1; i >= 0; i-- {
-		handler = m.middlewares[i](handler)
+	if m.middlewareChain.cached != nil {
+		return m.middlewareChain.cached
 	}
-	return handler
+
+	h := handler
+	for i := len(m.middlewares) - 1; i >= 0; i-- {
+		h = m.middlewares[i](h)
+	}
+	m.middlewareChain.cached = h
+	return h
 }
 
 func newMethodHandler() *methodHandler {
@@ -155,26 +187,29 @@ func (mh *methodHandler) updateAllowedList() {
 	mh.allowedList = strings.Join(append(methods, MethodOptions), ", ")
 }
 
+var pathSegmentPool = sync.Pool{
+	New: func() interface{} {
+		return make([]string, 0, 16)
+	},
+}
+
 func splitPath(path string) []string {
 	if path == "" || path == "/" {
 		return nil
 	}
 
-	segments := segmentsPool.Get().([]string)
+	segments := pathSegmentPool.Get().([]string)
 	segments = segments[:0]
 
-	start := 0
-	for i := 0; i < len(path); i++ {
+	var start int
+	for i := 1; i < len(path); i++ {
 		if path[i] == '/' {
-			if start < i {
-				segments = append(segments, path[start:i])
-			}
-			start = i + 1
+			segments = append(segments, path[start+1:i])
+			start = i
 		}
 	}
-
-	if start < len(path) {
-		segments = append(segments, path[start:])
+	if start < len(path)-1 {
+		segments = append(segments, path[start+1:])
 	}
 
 	return segments
