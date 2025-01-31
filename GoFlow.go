@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"unsafe"
 )
 
 // Common HTTP methods
@@ -227,23 +228,23 @@ func (m *Mux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (m *Mux) getPathSegments(path string) []string {
-	if path == "" || path == "/" {
-		return nil
-	}
-
 	segments := segmentsPool.Get().([]string)
 	segments = segments[:0]
 
-	var start int
-	for i := 1; i < len(path); i++ {
-		if path[i] == '/' {
-			segments = append(segments, path[start+1:i])
-			start = i
-		} else if i == len(path)-1 {
-			segments = append(segments, path[start+1:])
+	data := *(*[]byte)(unsafe.Pointer(&path))
+	start := 1
+
+	for i := 1; i < len(data); i++ {
+		if data[i] == '/' {
+			if i > start {
+				segments = append(segments, path[start:i])
+			}
+			start = i + 1
 		}
 	}
-
+	if start < len(data) {
+		segments = append(segments, path[start:])
+	}
 	return segments
 }
 
