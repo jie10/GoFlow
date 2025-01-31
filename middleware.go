@@ -283,11 +283,20 @@ func Cache(duration time.Duration) func(http.Handler) http.Handler {
 	}
 }
 
+var responseWriterPool = sync.Pool{
+	New: func() interface{} {
+		return &statusWriter{
+			headers: make(http.Header),
+		}
+	},
+}
+
 // Helper types
 type statusWriter struct {
 	http.ResponseWriter
-	status int
-	size   int64
+	status  int
+	size    int64
+	headers http.Header
 }
 
 func (w *statusWriter) WriteHeader(status int) {
