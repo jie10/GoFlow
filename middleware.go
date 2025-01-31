@@ -3,6 +3,7 @@ package GoFlow
 import (
 	"bytes"
 	"compress/gzip"
+	"container/list"
 	"context"
 	"log"
 	"net/http"
@@ -84,6 +85,24 @@ func Logger() func(http.Handler) http.Handler {
 			)
 		})
 	}
+}
+
+type RateLimiter struct {
+	buckets   sync.Map
+	maxSize   int
+	evictList *list.List // For LRU eviction
+	mu        sync.Mutex
+}
+
+func (rl *RateLimiter) cleanup() {
+	rl.mu.Lock()
+	for rl.evictList.Len() > rl.maxSize {
+		if elem := rl.evictList.Back(); elem != nil {
+			rl.buckets.Delete(elem.Value)
+			rl.evictList.Remove(elem)
+		}
+	}
+	rl.mu.Unlock()
 }
 
 // RateLimit implements a token bucket rate limiting middleware
